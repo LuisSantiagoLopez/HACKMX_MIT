@@ -63,7 +63,6 @@ class Bot:
 
         return last_message
 
-    # MÉTODO PARA MANEJAR LAS ACCIONES REQUERIDAS POR EL ASISTENTE
     def handle_requires_action(self, run):
         required_action = run.required_action
         if required_action.type == 'submit_tool_outputs':
@@ -83,7 +82,6 @@ class Bot:
                 # Execute the corresponding function
                 if function_name == "process_product_batch":
                     # Get user phone from arguments
-                    phone = args['user']['phone']
                     products = args['products']
                     
                     # Process the batch and get output
@@ -93,7 +91,6 @@ class Bot:
                     # Get arguments for selling product
                     barcode = args['barcode']
                     selling_price = args['selling_price']
-                    phone = args['phone']
 
                     # Sell the product and get output
                     output = sell_product({"barcode": barcode, "selling_price": selling_price}, self.user)
@@ -104,7 +101,7 @@ class Bot:
                     units = args['units']
 
                     # Generate the sales report
-                    report = generate_sales_report(timeframe, units, self.user)
+                    report = generate_sales_report(self.user, timeframe, units)  # Corrected order
                     output = json.dumps(report)
 
                 # Add the tool output
@@ -127,6 +124,7 @@ class Bot:
             run_id=run.id,
         )
         return run
+
 
     # SI YA EXISTÍA UNA CONVERSACIÓN PREVIA CON ESTE NÚMERO, SE DEVUELVE EL THREAD.
     # SI NO, SE CREA UN NUEVO THREAD.
@@ -167,6 +165,7 @@ class Bot:
             logger.error(f"Error: {str(e)}")
             return None
 
+
 def process_product_batch(data, user):
     products = data.get('products')
     if not products:
@@ -176,50 +175,84 @@ def process_product_batch(data, user):
         barcode = product_data.get('barcode')
         barcode = int(barcode)
         name = product_data.get('name')
-        buying_price = product_data.get('buying_price')
-        quantity = product_data.get('quantity', 0)
+        buying_price = float(product_data.get('buying_price', 0))
+        quantity = int(product_data.get('quantity', 0))
 
         if not barcode or not name or quantity <= 0:
             continue
 
         # Get or create the product
-        product, _ = Product.objects.get_or_create(barcode=barcode, defaults={'name': name})
-
-        # Get or create AuxProdUser and update quantity
-        aux_prod_user, created = AuxProdUser.objects.get_or_create(
-            user_aux=user, product_aux=product, buying_price=buying_price,
-            defaults={'quantity': quantity}
+        product, _ = Product.objects.get_or_create(
+            barcode=barcode,
+            defaults={'name': name}
         )
+
+        # Get or create AuxProdUser without buying_price in lookup
+        aux_prod_user, created = AuxProdUser.objects.get_or_create(
+            user_aux=user,
+            product_aux=product,
+            defaults={
+                'buying_price': buying_price,
+                'quantity': quantity
+            }
+        )
+
         if not created:
+            # Update quantity and buying_price as needed
             aux_prod_user.quantity += quantity
+            aux_prod_user.buying_price = buying_price  # Optional
             aux_prod_user.save()
 
     return "Batch processed successfully. Status: 201"
 
 def sell_product(data, user):
     barcode = data.get('barcode')
-    barcode = int(barcode)
     selling_price = data.get('selling_price')
 
     if not barcode or selling_price is None:
         return "Both barcode and selling price must be provided. Status: 400"
 
+    barcode = int(barcode)
+    selling_price = float(selling_price)
+
     # Get the product
-    product = Product.objects.filter(barcode=barcode).first()
-    if not product:
+    try:
+        product = Product.objects.get(barcode=barcode)
+    except Product.DoesNotExist:
         return "Product not found. Status: 404"
 
     # Get the AuxProdUser for the user and product
-    aux_prod_user = AuxProdUser.objects.filter(product_aux=product, user_aux=user).order_by('-id').first()
-    if not aux_prod_user or aux_prod_user.quantity <= 0:
+    try:
+        aux_prod_user = AuxProdUser.objects.get(
+            product_aux=product,
+            user_aux=user
+        )
+    except AuxProdUser.DoesNotExist:
         return "No available product for the user to sell. Status: 404"
 
-    # Register the transaction and update quantity
-    Transaction.objects.create(product_transaction=product, selling_price=selling_price)
-    aux_prod_user.quantity -= 1
-    aux_prod_user.save()
+    if aux_prod_user.quantity <= 0:
+        return "No available product for the user to sell. Status: 404"
 
-    return "Product sold successfully. Status: 201"
+    # Decrease quantity
+    aux_prod_user.quantity -= 1
+
+    # Delete the AuxProdUser instance if quantity is zero
+    if aux_prod_user.quantity == 0:
+        aux_prod_user.delete()
+        message = "Product sold successfully. You no longer have this product in your inventory. Status: 201"
+    else:
+        aux_prod_user.save()
+        message = "Product sold successfully. Status: 201"
+
+    # Register the transaction
+    Transaction.objects.create(
+        product_transaction=product,
+        user_transaction=user,
+        selling_price=selling_price
+    )
+
+    return message
+
 
 def generate_sales_report(user, timeframe, units):
     # Calculate the start date based on the timeframe
@@ -235,7 +268,7 @@ def generate_sales_report(user, timeframe, units):
 
     # Filter transactions for the user within the specified timeframe
     transactions = Transaction.objects.filter(
-        product_transaction__auxproduser__user_aux=user,
+        user_transaction=user,
         time__gte=start_date
     )
 
@@ -246,10 +279,11 @@ def generate_sales_report(user, timeframe, units):
         transaction.selling_price - aux_prod.buying_price
         for transaction in transactions
         if (aux_prod := AuxProdUser.objects.filter(
-            product_aux=transaction.product_transaction, user_aux=user
+            product_aux=transaction.product_transaction,
+            user_aux=user
         ).first())
     )
 
-    return (f"Total products sold: {total_products_sold}, "
-            f"Total revenue: {total_revenue}, "
-            f"Total profit: {total_profit}. Status: 200")
+    return (f"Total productos vendidos: {total_products_sold}, "
+            f"Total ingresado: {total_revenue}, "
+            f"Total de ganancias: {total_profit}. Status: 200")

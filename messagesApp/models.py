@@ -29,5 +29,6 @@ class Conversation(models.Model):
 
 class Transaction(models.Model):
     product_transaction = models.ForeignKey(Product, on_delete=models.CASCADE)
+    user_transaction = models.ForeignKey(CustomUser, on_delete=models.CASCADE, null=True, blank=True)
     selling_price = models.FloatField()
     time = models.DateTimeField(auto_now_add=True)
