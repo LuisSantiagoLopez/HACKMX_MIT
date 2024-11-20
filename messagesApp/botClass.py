@@ -3,11 +3,13 @@ import json
 import os
 from dotenv import load_dotenv
 from .models import Conversation, CustomUser, Product, AuxProdUser, Transaction
-from django.http import JsonResponse
 from django.utils import timezone
 from datetime import timedelta
 import logging
 from openai import OpenAI
+import re 
+from rapidfuzz import process, fuzz
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class Bot:
         # EL ASISTENTE SE CREARÁ CON UN THREAD ESPECÍFICO CON EL ID CORRESPONDIENTE AL NÚMERO DEL USUARIO. 
         self.thread = self.create_or_retrieve_thread()
 
-        self.assistant_id = "asst_Q6r8BuVcR0w3z89Q7R5xUWyt"
+        self.assistant_id = "asst_7gpT6VNSseo58Bh8nOwhqCCP"
 
     # ESTE MÉTODO EJECUTA UNA CONVERSACIÓN CON EL ASISTENTE.
     # SI ES LA PRIMERA VEZ QUE SE EJECUTA, SE ENVIARÁ EL PRIMER MENSAJE.
@@ -80,29 +82,28 @@ class Bot:
                 output = ""
 
                 # Execute the corresponding function
-                if function_name == "process_product_batch":
+                if function_name == "mandar_productos_inventario":
                     # Get user phone from arguments
                     products = args['products']
                     
                     # Process the batch and get output
                     output = process_product_batch({"products": products}, self.user)
 
-                elif function_name == "sell_product":
+                elif function_name == "vender_producto":
                     # Get arguments for selling product
-                    barcode = args['barcode']
+                    products = args['products']
                     selling_price = args['selling_price']
 
                     # Sell the product and get output
-                    output = sell_product({"barcode": barcode, "selling_price": selling_price}, self.user)
+                    output = sell_product({"productos": products, "precio_venta": selling_price}, self.user)
 
-                elif function_name == "generate_sales_report":
+                elif function_name == "generar_reporte_ventas":
                     # Get timeframe and units from arguments
                     timeframe = args['timeframe']
                     units = args['units']
 
                     # Generate the sales report
-                    report = generate_sales_report(self.user, timeframe, units)  # Corrected order
-                    output = json.dumps(report)
+                    output = generate_sales_report(self.user, timeframe, units) 
 
                 # Add the tool output
                 tool_outputs.append({
@@ -172,90 +173,199 @@ def process_product_batch(data, user):
         return "Products must be provided. Status: 400"
 
     for product_data in products:
-        barcode = product_data.get('barcode')
-        barcode = int(barcode)
+        # Obtener datos del producto
         name = product_data.get('name')
+        brand = product_data.get('brand')
+        category = product_data.get('category', "Otros")
+        amount = product_data.get('amount')
         buying_price = float(product_data.get('buying_price', 0))
         quantity = int(product_data.get('quantity', 0))
 
-        if not barcode or not name or quantity <= 0:
+        # Validar que los campos requeridos sean válidos
+        if not name or not category or not amount or quantity <= 0:
             continue
 
-        # Get or create the product
+        # Obtener o crear el producto principal
         product, _ = Product.objects.get_or_create(
-            barcode=barcode,
-            defaults={'name': name}
+            name=name,
+            brand=brand,
+            amount=amount,
+            defaults={
+                'category': category,
+            }
         )
 
-        # Get or create AuxProdUser without buying_price in lookup
+        # Obtener o crear el registro en AuxProdUser
         aux_prod_user, created = AuxProdUser.objects.get_or_create(
             user_aux=user,
             product_aux=product,
             defaults={
-                'buying_price': buying_price,
-                'quantity': quantity
+                'user_aux': user,
+                'product_aux': product,
+                'quantity': quantity,
+                'buying_price': buying_price
             }
         )
 
         if not created:
-            # Update quantity and buying_price as needed
+            # Actualizar cantidad y precio de compra
             aux_prod_user.quantity += quantity
-            aux_prod_user.buying_price = buying_price  # Optional
             aux_prod_user.save()
 
     return "Batch processed successfully. Status: 201"
 
+
+def normalize_text(text):
+    if not text:
+        return ''
+    # Eliminar acentos y caracteres especiales
+    text = unicodedata.normalize('NFKD', str(text)).encode('ASCII', 'ignore').decode('utf-8')
+    # Convertir a minúsculas
+    text = text.lower()
+    # Eliminar caracteres especiales como guiones, apóstrofes, puntos, comas, etc.
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    # Eliminar espacios adicionales
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 def sell_product(data, user):
-    barcode = data.get('barcode')
-    selling_price = data.get('selling_price')
+    logger.debug("Iniciando la función sell_product")
+    productos = data.get('productos')
+    precio_venta = data.get('precio_venta')
+    logger.debug(f"Datos recibidos - precio_venta: {precio_venta}, productos: {productos}")
 
-    if not barcode or selling_price is None:
-        return "Both barcode and selling price must be provided. Status: 400"
+    if not productos or precio_venta is None:
+        logger.error("No se proporcionaron 'productos' o 'precio_venta'")
+        return "Debe proporcionar 'productos' y 'precio_venta'. Status: 400"
 
-    barcode = int(barcode)
-    selling_price = float(selling_price)
+    precio_venta = float(precio_venta)
+    mensajes = []
 
-    # Get the product
-    try:
-        product = Product.objects.get(barcode=barcode)
-    except Product.DoesNotExist:
-        return "Product not found. Status: 404"
+    for producto_data in productos:
+        logger.debug(f"Procesando producto: {producto_data}")
+        nombre = producto_data.get('nombre')
+        marca = producto_data.get('marca')
+        categoría = producto_data.get('categoría')
+        unidad_medida = producto_data.get('unidad_medida')
+        cantidad = int(producto_data.get('cantidad', 1))
 
-    # Get the AuxProdUser for the user and product
-    try:
-        aux_prod_user = AuxProdUser.objects.get(
-            product_aux=product,
-            user_aux=user
+        # Validar que los campos requeridos estén presentes y correctos
+        if not all([nombre, categoría, unidad_medida, marca is not None]) or cantidad <= 0:
+            logger.error(f"Datos inválidos para el producto '{nombre}': {producto_data}")
+            mensajes.append(f"El producto '{nombre}' no tiene todos los datos requeridos o los valores son inválidos. No se procesó la venta de este producto.")
+            continue
+
+        # Normalizar y combinar nombre y unidad de medida
+        nombre_normalizado = normalize_text(nombre)
+        unidad_medida_normalizada = normalize_text(unidad_medida)
+        nombre_unidad = f"{nombre_normalizado} {unidad_medida_normalizada}"
+        marca_normalizada = normalize_text(marca)
+        categoría_normalizada = normalize_text(categoría)
+        logger.debug(f"Datos normalizados - nombre_unidad: {nombre_unidad}, marca: {marca_normalizada}, categoría: {categoría_normalizada}")
+
+        # Obtener productos en la categoría
+        productos_en_categoria = AuxProdUser.objects.filter(
+            user_aux=user,
+            product_aux__category__iexact=categoría
+        ).select_related('product_aux')
+
+        logger.debug(f"Productos encontrados en la categoría '{categoría}' para el usuario '{user}': {productos_en_categoria.count()}")
+
+        if not productos_en_categoria.exists():
+            logger.error(f"No se encontraron productos en la categoría '{categoría}' asociados al usuario '{user}'")
+            mensajes.append(f"No se encontraron productos en la categoría '{categoría}' asociados a tu inventario.")
+            continue
+
+        # Crear listas de nombres (nombre + unidad) y marcas normalizados
+        nombres_unidad_productos = []
+        marcas_productos = []
+        productos_lista = []
+
+        for producto in productos_en_categoria:
+            nombre_prod_norm = normalize_text(producto.name)
+            unidad_medida_prod_norm = normalize_text(producto.amount)
+            nombre_unidad_prod = f"{nombre_prod_norm} {unidad_medida_prod_norm}"
+            marca_prod_norm = normalize_text(producto.brand)
+            nombres_unidad_productos.append(nombre_unidad_prod)
+            marcas_productos.append(marca_prod_norm)
+            productos_lista.append(producto)
+
+        # Encontrar el producto con el nombre y unidad más similar
+        match = process.extractOne(nombre_unidad, nombres_unidad_productos, scorer=fuzz.token_sort_ratio)
+        logger.debug(f"Resultado del matching difuso para '{nombre_unidad}': {match}")
+
+        if match and match[1] >= 80:  # Umbral de similitud del 80%
+            idx = nombres_unidad_productos.index(match[0])
+            producto_encontrado = productos_lista[idx]
+            logger.debug(f"Producto encontrado: {producto_encontrado.name} (ID: {producto_encontrado.id}), Unidad: {producto_encontrado.amount}, con similitud de {match[1]}%")
+
+            # Si se proporcionó marca, verificar similitud de marca
+            if marca_normalizada:
+                ratio_marca = fuzz.token_sort_ratio(marca_normalizada, marcas_productos[idx])
+                logger.debug(f"Similitud de marca para '{marca_normalizada}': {ratio_marca}%")
+                if ratio_marca < 80:
+                    logger.error(f"La marca '{marca}' no coincide suficientemente con '{producto_encontrado.brand}'")
+                    mensajes.append(f"No se encontró una marca similar a '{marca}' para el producto '{nombre}'.")
+                    continue
+        else:
+            logger.error(f"No se encontró un producto similar a '{nombre}' con unidad '{unidad_medida}' en la categoría '{categoría}'")
+            mensajes.append(f"No se encontró un producto similar a '{nombre}' con unidad '{unidad_medida}' en la categoría '{categoría}'.")
+            continue
+
+        # Buscar el AuxProdUser asociado al usuario para obtener 'buying_price'
+        try:
+            aux_prod_user = AuxProdUser.objects.get(product_aux=producto_encontrado, user_aux=user)
+            logger.debug(f"Producto en inventario del usuario. Cantidad disponible: {aux_prod_user.quantity}")
+        except AuxProdUser.DoesNotExist:
+            logger.error(f"El usuario no tiene el producto '{producto_encontrado.name}' en su inventario")
+            mensajes.append(f"No tienes disponible el producto '{producto_encontrado.name}' para vender.")
+            continue
+
+        if aux_prod_user.quantity < cantidad:
+            logger.error(f"Cantidad insuficiente del producto '{producto_encontrado.name}'. Disponible: {aux_prod_user.quantity}, solicitada: {cantidad}")
+            mensajes.append(f"No hay suficientes unidades del producto '{producto_encontrado.name}' para vender. Disponibles: {aux_prod_user.quantity}.")
+            continue
+
+        # Obtener el precio de compra del AuxProdUser
+        precio_compra = aux_prod_user.buying_price
+        logger.debug(f"Precio de compra obtenido del AuxProdUser: {precio_compra}")
+
+        # Reducir la cantidad del producto
+        aux_prod_user.quantity -= cantidad
+        logger.debug(f"Reduciendo cantidad del producto '{producto_encontrado.name}' en el inventario del usuario. Nueva cantidad: {aux_prod_user.quantity}")
+
+        # Eliminar el AuxProdUser si la cantidad llega a 0
+        if aux_prod_user.quantity == 0:
+            aux_prod_user.delete()
+            logger.debug(f"El producto '{producto_encontrado.name}' se ha agotado en el inventario del usuario y se eliminó el registro de AuxProdUser")
+        else:
+            aux_prod_user.save()
+            logger.debug(f"Actualizada la cantidad del producto '{producto_encontrado.name}' en el inventario del usuario")
+
+        # Registrar la transacción
+        transaction = Transaction.objects.create(
+            product_transaction=producto_encontrado,
+            user_transaction=user,
+            selling_price_unitario=precio_venta,
+            buying_price_unitario=precio_compra,
+            quantity=cantidad
         )
-    except AuxProdUser.DoesNotExist:
-        return "No available product for the user to sell. Status: 404"
+        logger.debug(f"Transacción registrada: ID {transaction.id} - Producto '{producto_encontrado.name}', Cantidad: {cantidad}, Precio venta unitario: {precio_venta}")
 
-    if aux_prod_user.quantity <= 0:
-        return "No available product for the user to sell. Status: 404"
+        mensajes.append(f"Producto '{producto_encontrado.name}' vendido con éxito. Cantidad vendida: {cantidad}.")
 
-    # Decrease quantity
-    aux_prod_user.quantity -= 1
-
-    # Delete the AuxProdUser instance if quantity is zero
-    if aux_prod_user.quantity == 0:
-        aux_prod_user.delete()
-        message = "Product sold successfully. You no longer have this product in your inventory. Status: 201"
+    if mensajes:
+        logger.debug("Proceso de venta completado con mensajes")
+        return "\n".join(mensajes) + " Status: 201"
     else:
-        aux_prod_user.save()
-        message = "Product sold successfully. Status: 201"
-
-    # Register the transaction
-    Transaction.objects.create(
-        product_transaction=product,
-        user_transaction=user,
-        selling_price=selling_price
-    )
-
-    return message
-
+        logger.error("No se pudo procesar ninguna venta")
+        return "No se pudo procesar ninguna venta. Verifique los datos proporcionados. Status: 400"
 
 def generate_sales_report(user, timeframe, units):
-    # Calculate the start date based on the timeframe
+    logger.debug("Iniciando la función generate_sales_report")
+    logger.debug(f"Datos recibidos - user: {user}, timeframe: {timeframe}, units: {units}")
+
+    # Validar el timeframe
     now = timezone.now()
     if timeframe == 'days':
         start_date = now - timedelta(days=units)
@@ -264,26 +374,43 @@ def generate_sales_report(user, timeframe, units):
     elif timeframe == 'months':
         start_date = now - timedelta(days=30 * units)
     else:
-        return "Invalid timeframe. Use 'days', 'weeks', or 'months'. Status: 400"
+        logger.error("Periodo de tiempo inválido")
+        return "Periodo de tiempo inválido. Use 'days', 'weeks' o 'months'. Status: 400"
 
-    # Filter transactions for the user within the specified timeframe
+    # Filtrar transacciones por usuario y fecha
     transactions = Transaction.objects.filter(
         user_transaction=user,
         time__gte=start_date
     )
+    logger.debug(f"Transacciones encontradas: {transactions.count()}")
 
-    total_products_sold = transactions.count()
-    total_revenue = sum(transaction.selling_price for transaction in transactions)
+    if not transactions.exists():
+        logger.debug("No se encontraron transacciones en el periodo especificado")
+        return f"No se encontraron transacciones para el usuario {user} en el periodo especificado. Status: 404"
+
+    # Calcular métricas
+    total_products_sold = sum(transaction.quantity for transaction in transactions)
+    logger.debug(f"Total de productos vendidos: {total_products_sold}")
+
+    total_revenue = sum(transaction.selling_price_unitario * transaction.quantity for transaction in transactions)
+    logger.debug(f"Ingresos totales: {total_revenue}")
 
     total_profit = sum(
-        transaction.selling_price - aux_prod.buying_price
+        (transaction.selling_price_unitario - transaction.buying_price_unitario) * transaction.quantity
         for transaction in transactions
-        if (aux_prod := AuxProdUser.objects.filter(
-            product_aux=transaction.product_transaction,
-            user_aux=user
-        ).first())
     )
+    logger.debug(f"Ganancia total: {total_profit}")
 
-    return (f"Total productos vendidos: {total_products_sold}, "
-            f"Total ingresado: {total_revenue}, "
-            f"Total de ganancias: {total_profit}. Status: 200")
+    # Generar el reporte como string
+    report = (
+        f"Reporte de Ventas:\n"
+        f"Usuario: {user}\n"
+        f"Periodo: Últimos {units} {timeframe}\n"
+        f"Total de productos vendidos: {total_products_sold}\n"
+        f"Ingresos totales: ${total_revenue:.2f}\n"
+        f"Ganancia total: ${total_profit:.2f}\n"
+        f"Status: 200 - Reporte generado exitosamente."
+    )
+    logger.debug(f"Reporte generado: {report}")
+
+    return report
